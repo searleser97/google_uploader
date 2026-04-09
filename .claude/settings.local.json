@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(go mod init:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(go build:*)",
+      "Bash(./yt_uploader:*)",
+      "Bash(go install:*)",
+      "Bash(go env:*)",
+      "Bash(echo:*)"
+    ]
+  }
+}

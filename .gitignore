@@ -1,0 +1,41 @@
+# Binaries
+google_uploader
+yt_uploader
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Authentication and secrets
+client_secret.json
+token.json
+
+# Upload state
+.upload_state.json
+upload_state_*.json
+
+# Generated files
+invalid_photos.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
