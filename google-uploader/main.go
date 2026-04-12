@@ -26,8 +26,7 @@ import (
 
 const (
 	stateFilePrefix = "upload_state_"
-	tokenFile       = "token.json"
-	credFile        = "client_secret.json"
+	configDir       = ".google_uploader"
 	maxRetries      = 3
 	retryDelay      = 5 * time.Second
 	photosUploadURL = "https://photoslibrary.googleapis.com/v1/uploads"
@@ -482,7 +481,24 @@ func main() {
 	}
 }
 
+func configDirPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Unable to determine home directory: %v", err)
+	}
+	return filepath.Join(home, configDir)
+}
+
+func credFilePath() string {
+	return filepath.Join(configDirPath(), "client_secret.json")
+}
+
+func tokenFilePath() string {
+	return filepath.Join(configDirPath(), "token.json")
+}
+
 func getOAuthConfig() (*oauth2.Config, error) {
+	credFile := credFilePath()
 	credentials, err := os.ReadFile(credFile)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read client secret file: %v\nPlease download your OAuth2 credentials from Google Cloud Console and save as '%s'", err, credFile)
@@ -509,6 +525,7 @@ func getYouTubeService(ctx context.Context, httpClient *http.Client) (*youtube.S
 }
 
 func getClient(ctx context.Context, config *oauth2.Config) *http.Client {
+	tokenFile := tokenFilePath()
 	token, err := tokenFromFile(tokenFile)
 	if err != nil {
 		token = getTokenFromWeb(config)
@@ -549,6 +566,9 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 }
 
 func saveToken(path string, token *oauth2.Token) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		log.Fatalf("Unable to create config directory: %v", err)
+	}
 	fmt.Printf("Saving credential file to: %s\n", path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {

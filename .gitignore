@@ -1,6 +1,8 @@
-# Binaries
-google_uploader
-yt_uploader
+# Binaries (only at root, not the source directories)
+/google_uploader
+/copy-missing-files-bin
+/organize-by-date-bin
+/yt_uploader
 *.exe
 *.exe~
 *.dll
