@@ -86,7 +86,10 @@ Options:
 		fmt.Println("═══════════════════════════════════════════")
 		fmt.Println("  Step 2/3: Organizing by date")
 		fmt.Println("═══════════════════════════════════════════")
-		if err := runTool(selfDir, "organize-by-date", target); err != nil {
+		missingDir := filepath.Join(target, "MISSING_FROM_ORIGIN")
+		if _, err := os.Stat(missingDir); os.IsNotExist(err) {
+			fmt.Println("No MISSING_FROM_ORIGIN folder found, skipping.")
+		} else if err := runTool(selfDir, "organize-by-date", missingDir, target); err != nil {
 			log.Fatalf("organize-by-date failed: %v", err)
 		}
 		fmt.Println()
