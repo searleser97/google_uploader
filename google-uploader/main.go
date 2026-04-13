@@ -177,8 +177,24 @@ func main() {
 	totalPhotosUploaded := 0
 	totalVideosUploaded := 0
 
+	// Pre-scan all folders for total counts
+	overallTotalPhotos := 0
+	overallTotalVideos := 0
+	overallCompletedPhotos := 0
+	overallCompletedVideos := 0
+	for _, folderPath := range folderPaths {
+		fs := state.Folders[folderPath]
+		photos, _ := getImageFiles(folderPath)
+		videos, _ := getVideoFiles(folderPath)
+		overallTotalPhotos += len(photos)
+		overallTotalVideos += len(videos)
+		overallCompletedPhotos += len(fs.UploadedPhotos)
+		overallCompletedVideos += len(fs.UploadedVideos)
+	}
+
 	// ── Global Pass 1: Photos across all folders ──
 	fmt.Println("\n📷 Pass 1: Uploading photos to Google Photos...")
+	fmt.Printf("  Overall: %d/%d photos completed\n", overallCompletedPhotos, overallTotalPhotos)
 
 	// In collection mode, create or reuse the single album
 	if useCollection != "" && state.CollectionAlbumID == "" {
@@ -275,9 +291,10 @@ func main() {
 			fs.LastProcessed = filename
 			fs.CompletedPhotos++
 			totalPhotosUploaded++
+			overallCompletedPhotos++
 			saveState(state, stateFile)
 
-			fmt.Printf("    Progress: %d/%d photos completed\n", fs.CompletedPhotos, fs.TotalPhotos)
+			fmt.Printf("    Progress: %d/%d photos (folder) | %d/%d photos (overall)\n", fs.CompletedPhotos, fs.TotalPhotos, overallCompletedPhotos, overallTotalPhotos)
 		}
 
 		fs.PhotosDone = true
@@ -287,6 +304,7 @@ func main() {
 
 	// ── Global Pass 2: Videos across all folders ──
 	fmt.Println("\n🎬 Pass 2: Uploading videos to YouTube...")
+	fmt.Printf("  Overall: %d/%d videos completed\n", overallCompletedVideos, overallTotalVideos)
 
 	// Determine if YouTube service is needed (scan videos now to pick up newly added files)
 	needsYouTube := false
@@ -412,9 +430,10 @@ func main() {
 			fs.LastProcessed = filename
 			fs.CompletedVideos++
 			totalVideosUploaded++
+			overallCompletedVideos++
 			saveState(state, stateFile)
 
-			fmt.Printf("    Progress: %d/%d videos completed\n", fs.CompletedVideos, fs.TotalVideos)
+			fmt.Printf("    Progress: %d/%d videos (folder) | %d/%d videos (overall)\n", fs.CompletedVideos, fs.TotalVideos, overallCompletedVideos, overallTotalVideos)
 		}
 
 		fs.VideosDone = true
