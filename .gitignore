@@ -28,6 +28,8 @@ token.json
 # Upload state
 .upload_state.json
 upload_state_*.json
+.upload_tracker.json
+.upload_status.json
 
 # Generated files
 invalid_photos.txt

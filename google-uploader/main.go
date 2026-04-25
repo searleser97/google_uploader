@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/searleser97/media_workflow_tools/internal/tracker"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
@@ -142,6 +143,39 @@ func main() {
 		log.Fatal("Error: no folders in session — provide at least one folder path\nUsage: google_uploader -session <name> [-collection <name>] /path/to/folder1 [/path/to/folder2 ...]")
 	}
 
+	// Determine the common parent for the top-level tracker
+	trackerRoot := ""
+	for path := range state.Folders {
+		parent := filepath.Dir(path)
+		if trackerRoot == "" {
+			trackerRoot = parent
+		} else if trackerRoot != parent {
+			trackerRoot = ""
+			break
+		}
+	}
+
+	// Load top-level tracker (if all folders share a parent)
+	var topTracker *tracker.TopLevelTracker
+	if trackerRoot != "" {
+		topTracker = tracker.LoadTopLevel(trackerRoot)
+	}
+
+	// Migrate session state uploads into per-folder trackers
+	for absPath, fs := range state.Folders {
+		ft := tracker.LoadFolder(absPath)
+		migrated := false
+		if ft.MergePhotos(fs.UploadedPhotos) > 0 {
+			migrated = true
+		}
+		if ft.MergeVideos(fs.UploadedVideos) > 0 {
+			migrated = true
+		}
+		if migrated {
+			tracker.SaveFolder(absPath, ft)
+		}
+	}
+
 	// Collect folders still needing work
 	var folderPaths []string
 	for path, fs := range state.Folders {
@@ -152,9 +186,21 @@ func main() {
 			fs.PhotosDone = false
 			fs.VideosDone = false
 		}
-		if !fs.Completed {
-			folderPaths = append(folderPaths, path)
+
+		// Check top-level tracker for completion
+		folderName := filepath.Base(path)
+		if topTracker != nil && topTracker.IsCompleted(folderName) && fs.Completed {
+			continue
 		}
+
+		// If top-level says incomplete but session says complete, reopen it
+		if fs.Completed {
+			fs.Completed = false
+			fs.PhotosDone = false
+			fs.VideosDone = false
+		}
+
+		folderPaths = append(folderPaths, path)
 	}
 	sort.Strings(folderPaths)
 
@@ -177,19 +223,21 @@ func main() {
 	totalPhotosUploaded := 0
 	totalVideosUploaded := 0
 
-	// Pre-scan all folders for total counts
+	// Pre-scan all folders for total counts (using per-folder trackers)
 	overallTotalPhotos := 0
 	overallTotalVideos := 0
 	overallCompletedPhotos := 0
 	overallCompletedVideos := 0
+	folderTrackers := make(map[string]*tracker.FolderTracker)
 	for _, folderPath := range folderPaths {
-		fs := state.Folders[folderPath]
+		ft := tracker.LoadFolder(folderPath)
+		folderTrackers[folderPath] = ft
 		photos, _ := getImageFiles(folderPath)
 		videos, _ := getVideoFiles(folderPath)
 		overallTotalPhotos += len(photos)
 		overallTotalVideos += len(videos)
-		overallCompletedPhotos += len(fs.UploadedPhotos)
-		overallCompletedVideos += len(fs.UploadedVideos)
+		overallCompletedPhotos += len(ft.UploadedPhotos)
+		overallCompletedVideos += len(ft.UploadedVideos)
 	}
 
 	// ── Global Pass 1: Photos across all folders ──
@@ -212,6 +260,7 @@ func main() {
 
 	for folderIdx, folderPath := range folderPaths {
 		fs := state.Folders[folderPath]
+		ft := folderTrackers[folderPath]
 
 		photos, err := getImageFiles(folderPath)
 		if err != nil {
@@ -225,13 +274,22 @@ func main() {
 		}
 
 		fs.TotalPhotos = len(photos)
+		completedCount := 0
+		for _, p := range photos {
+			if ft.HasPhoto(filepath.Base(p)) {
+				completedCount++
+			}
+		}
 		fmt.Printf("\n[Folder %d/%d] %s — %d photo(s)\n", folderIdx+1, len(folderPaths), fs.FolderName, len(photos))
 
-		if fs.CompletedPhotos > 0 {
-			fmt.Printf("  Resuming: %d/%d photos already uploaded\n", fs.CompletedPhotos, fs.TotalPhotos)
+		if completedCount > 0 {
+			fmt.Printf("  Resuming: %d/%d photos already uploaded\n", completedCount, fs.TotalPhotos)
 		}
 
-		if fs.PhotosDone {
+		// Check if all photos are already uploaded via per-folder tracker
+		allPhotosDone := completedCount == len(photos)
+		if allPhotosDone {
+			fs.PhotosDone = true
 			fmt.Printf("  ✓ Photos already complete for %s\n", fs.FolderName)
 			continue
 		}
@@ -265,7 +323,7 @@ func main() {
 		for i, photoPath := range photos {
 			filename := filepath.Base(photoPath)
 
-			if itemID, exists := fs.UploadedPhotos[filename]; exists {
+			if itemID, exists := ft.UploadedPhotos[filename]; exists {
 				fmt.Printf("  [%d/%d] ✓ Skipping (already uploaded): %s (ID: %s)\n", i+1, len(photos), filename, itemID)
 				continue
 			}
@@ -287,11 +345,14 @@ func main() {
 
 			fmt.Printf("    ✓ Photo uploaded successfully! ID: %s\n", itemID)
 
+			// Write to both per-folder tracker and session state
+			ft.UploadedPhotos[filename] = itemID
 			fs.UploadedPhotos[filename] = itemID
 			fs.LastProcessed = filename
 			fs.CompletedPhotos++
 			totalPhotosUploaded++
 			overallCompletedPhotos++
+			tracker.SaveFolder(folderPath, ft)
 			saveState(state, stateFile)
 
 			fmt.Printf("    Progress: %d/%d photos (folder) | %d/%d photos (overall)\n", fs.CompletedPhotos, fs.TotalPhotos, overallCompletedPhotos, overallTotalPhotos)
@@ -306,15 +367,19 @@ func main() {
 	fmt.Println("\n🎬 Pass 2: Uploading videos to YouTube...")
 	fmt.Printf("  Overall: %d/%d videos completed\n", overallCompletedVideos, overallTotalVideos)
 
-	// Determine if YouTube service is needed (scan videos now to pick up newly added files)
+	// Determine if YouTube service is needed
 	needsYouTube := false
 	for _, folderPath := range folderPaths {
-		fs := state.Folders[folderPath]
-		if fs.VideosDone {
-			continue
-		}
+		ft := folderTrackers[folderPath]
 		videos, _ := getVideoFiles(folderPath)
-		if len(videos) > 0 {
+		allVideosDone := true
+		for _, v := range videos {
+			if !ft.HasVideo(filepath.Base(v)) {
+				allVideosDone = false
+				break
+			}
+		}
+		if !allVideosDone && len(videos) > 0 {
 			needsYouTube = true
 			break
 		}
@@ -344,6 +409,7 @@ func main() {
 
 	for folderIdx, folderPath := range folderPaths {
 		fs := state.Folders[folderPath]
+		ft := folderTrackers[folderPath]
 
 		videos, err := getVideoFiles(folderPath)
 		if err != nil {
@@ -357,13 +423,21 @@ func main() {
 		}
 
 		fs.TotalVideos = len(videos)
+		completedCount := 0
+		for _, v := range videos {
+			if ft.HasVideo(filepath.Base(v)) {
+				completedCount++
+			}
+		}
 		fmt.Printf("\n[Folder %d/%d] %s — %d video(s)\n", folderIdx+1, len(folderPaths), fs.FolderName, len(videos))
 
-		if fs.CompletedVideos > 0 {
-			fmt.Printf("  Resuming: %d/%d videos already uploaded\n", fs.CompletedVideos, fs.TotalVideos)
+		if completedCount > 0 {
+			fmt.Printf("  Resuming: %d/%d videos already uploaded\n", completedCount, fs.TotalVideos)
 		}
 
-		if fs.VideosDone {
+		allVideosDone := completedCount == len(videos)
+		if allVideosDone {
+			fs.VideosDone = true
 			fmt.Printf("  ✓ Videos already complete for %s\n", fs.FolderName)
 			continue
 		}
@@ -397,7 +471,7 @@ func main() {
 		for i, videoPath := range videos {
 			filename := filepath.Base(videoPath)
 
-			if videoID, exists := fs.UploadedVideos[filename]; exists {
+			if videoID, exists := ft.UploadedVideos[filename]; exists {
 				fmt.Printf("  [%d/%d] ✓ Skipping (already uploaded): %s (ID: %s)\n", i+1, len(videos), filename, videoID)
 				continue
 			}
@@ -426,11 +500,14 @@ func main() {
 				fmt.Printf("    ✓ Added to playlist\n")
 			}
 
+			// Write to both per-folder tracker and session state
+			ft.UploadedVideos[filename] = videoID
 			fs.UploadedVideos[filename] = videoID
 			fs.LastProcessed = filename
 			fs.CompletedVideos++
 			totalVideosUploaded++
 			overallCompletedVideos++
+			tracker.SaveFolder(folderPath, ft)
 			saveState(state, stateFile)
 
 			fmt.Printf("    Progress: %d/%d videos (folder) | %d/%d videos (overall)\n", fs.CompletedVideos, fs.TotalVideos, overallCompletedVideos, overallTotalVideos)
@@ -441,14 +518,29 @@ func main() {
 		fmt.Printf("  ✓ Videos complete for %s\n", fs.FolderName)
 	}
 
-	// ── Mark folders as completed and print summary ──
+	// ── Mark folders as completed and update top-level tracker ──
 	for _, folderPath := range folderPaths {
 		fs := state.Folders[folderPath]
-		if fs.PhotosDone && fs.VideosDone {
+		ft := folderTrackers[folderPath]
+
+		if !fs.PhotosDone || !fs.VideosDone {
+			continue
+		}
+
+		// Only mark complete if all current files are in the tracker and no failures
+		photos, _ := getImageFiles(folderPath)
+		videos, _ := getVideoFiles(folderPath)
+		if len(fs.FailedFiles) == 0 && ft.IsFullyUploaded(photos, videos) {
 			fs.Completed = true
+			if topTracker != nil {
+				topTracker.MarkComplete(filepath.Base(folderPath))
+			}
 		}
 	}
 	saveState(state, stateFile)
+	if topTracker != nil && trackerRoot != "" {
+		tracker.SaveTopLevel(trackerRoot, topTracker)
+	}
 
 	fmt.Println("\n" + strings.Repeat("=", 50))
 

@@ -15,6 +15,7 @@ import (
 	"github.com/searleser97/media_workflow_tools/internal/exif"
 	"github.com/searleser97/media_workflow_tools/internal/fileutil"
 	"github.com/searleser97/media_workflow_tools/internal/progress"
+	"github.com/searleser97/media_workflow_tools/internal/tracker"
 )
 
 var dateFolderPattern = regexp.MustCompile(`^\d{4}_\d{2}_\d{2}$`)
@@ -155,6 +156,7 @@ func main() {
 	moved := 0
 	renamed := 0
 	var failedDeletes []string
+	foldersWithNewFiles := make(map[string]bool)
 	bar = progress.NewBar(30)
 
 	for _, date := range sortedDates {
@@ -231,6 +233,7 @@ func main() {
 				}
 			}
 
+			foldersWithNewFiles[date] = true
 			moved++
 			bar.Print(moved, total)
 		}
@@ -244,6 +247,25 @@ func main() {
 	if len(failedDeletes) > 0 {
 		fmt.Printf("\n⚠️  Could not delete %d source file(s) (permission denied).\n", len(failedDeletes))
 		fmt.Println("   Files were copied successfully but originals remain on the source drive.")
+	}
+
+	// Update upload tracker: mark folders with new files as incomplete
+	if len(foldersWithNewFiles) > 0 {
+		topTracker := tracker.LoadTopLevel(destFolder)
+		toggled := 0
+		for date := range foldersWithNewFiles {
+			if topTracker.IsCompleted(date) {
+				topTracker.MarkIncomplete(date)
+				toggled++
+			}
+		}
+		if toggled > 0 {
+			if err := tracker.SaveTopLevel(destFolder, topTracker); err != nil {
+				log.Printf("Warning: could not update upload tracker: %v", err)
+			} else {
+				fmt.Printf("Toggled %d folder(s) to incomplete in upload tracker.\n", toggled)
+			}
+		}
 	}
 
 	// Clean up empty directories
