@@ -48,7 +48,7 @@ func SaveTopLevel(dir string, t *TopLevelTracker) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, TopLevelFileName), data, 0644)
+	return atomicWrite(filepath.Join(dir, TopLevelFileName), data)
 }
 
 // IsCompleted checks if a folder is marked as completed.
@@ -105,7 +105,34 @@ func SaveFolder(folderPath string, ft *FolderTracker) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(folderPath, FolderFileName), data, 0644)
+	return atomicWrite(filepath.Join(folderPath, FolderFileName), data)
+}
+
+// atomicWrite writes data to a temp file then renames it to the target path,
+// ensuring the file is never left in a partially-written state.
+func atomicWrite(targetPath string, data []byte) error {
+	dir := filepath.Dir(targetPath)
+	tmp, err := os.CreateTemp(dir, ".tmp-tracker-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, targetPath)
 }
 
 // HasPhoto checks if a photo filename is already tracked as uploaded.

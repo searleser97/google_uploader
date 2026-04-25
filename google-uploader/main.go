@@ -207,12 +207,13 @@ func main() {
 			fmt.Printf("    ✓ Photo uploaded successfully! ID: %s\n", itemID)
 
 			ft.UploadedPhotos[filename] = itemID
+			completedCount++
 			totalPhotosUploaded++
 			overallCompletedPhotos++
 			tracker.SaveFolder(folderPath, ft)
 
 			fmt.Printf("    Progress: %d/%d photos (folder) | %d/%d photos (overall)\n",
-				completedCount+totalPhotosUploaded, len(photos), overallCompletedPhotos, overallTotalPhotos)
+				completedCount, len(photos), overallCompletedPhotos, overallTotalPhotos)
 		}
 
 		fmt.Printf("  ✓ Photos pass complete for %s\n", folderName)
@@ -306,12 +307,13 @@ func main() {
 			fmt.Printf("    ✓ Video uploaded successfully! ID: %s\n", videoID)
 
 			ft.UploadedVideos[filename] = videoID
+			completedCount++
 			totalVideosUploaded++
 			overallCompletedVideos++
 			tracker.SaveFolder(folderPath, ft)
 
 			fmt.Printf("    Progress: %d/%d videos (folder) | %d/%d videos (overall)\n",
-				completedCount+totalVideosUploaded, len(videos), overallCompletedVideos, overallTotalVideos)
+				completedCount, len(videos), overallCompletedVideos, overallTotalVideos)
 		}
 
 		fmt.Printf("  ✓ Videos pass complete for %s\n", folderName)

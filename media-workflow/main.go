@@ -223,15 +223,55 @@ func ejectRemovableOrigins(origins []string) {
 
 // resolveMount returns the mount point and source device for a given path.
 func resolveMount(path string) (mountpoint, device string, err error) {
-	out, err := exec.Command("findmnt", "-n", "-o", "TARGET,SOURCE", "--target", path).Output()
+	out, err := exec.Command("findmnt", "-n", "--pairs", "-o", "TARGET,SOURCE", "--target", path).Output()
 	if err != nil {
 		return "", "", err
 	}
-	fields := strings.Fields(strings.TrimSpace(string(out)))
-	if len(fields) < 2 {
+	// --pairs output format: TARGET="/media/user/My Drive" SOURCE="/dev/sdc1"
+	pairs := parsePairs(string(out))
+	target, ok1 := pairs["TARGET"]
+	source, ok2 := pairs["SOURCE"]
+	if !ok1 || !ok2 {
 		return "", "", fmt.Errorf("unexpected findmnt output: %s", string(out))
 	}
-	return fields[0], fields[1], nil
+	return target, source, nil
+}
+
+// parsePairs parses KEY="VALUE" pairs from findmnt --pairs output.
+func parsePairs(s string) map[string]string {
+	result := make(map[string]string)
+	s = strings.TrimSpace(s)
+	for len(s) > 0 {
+		eq := strings.Index(s, "=")
+		if eq < 0 {
+			break
+		}
+		key := s[:eq]
+		s = s[eq+1:]
+		var value string
+		if len(s) > 0 && s[0] == '"' {
+			// Quoted value
+			end := strings.Index(s[1:], "\"")
+			if end < 0 {
+				break
+			}
+			value = s[1 : end+1]
+			s = s[end+2:]
+		} else {
+			// Unquoted value (up to next space)
+			end := strings.IndexByte(s, ' ')
+			if end < 0 {
+				value = s
+				s = ""
+			} else {
+				value = s[:end]
+				s = s[end:]
+			}
+		}
+		result[key] = value
+		s = strings.TrimLeft(s, " ")
+	}
+	return result
 }
 
 // isRemovable checks whether a block device is removable (e.g., SD card, USB).
