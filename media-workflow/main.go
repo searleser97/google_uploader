@@ -11,8 +11,8 @@ import (
 )
 
 func main() {
-	session := flag.String("session", "", "Session name for google-uploader (required)")
-	collection := flag.String("collection", "", "Collection album/playlist name for google-uploader")
+	session := flag.String("session", "", "Session name (deprecated, ignored)")
+	collection := flag.String("collection", "", "Collection name (deprecated, ignored)")
 	imagesOnly := flag.Bool("images-only", false, "Only process image files in copy-missing-files")
 	skipCopy := flag.Bool("skip-copy", false, "Skip the copy-missing-files step")
 	skipOrganize := flag.Bool("skip-organize", false, "Skip the organize-by-date step")
@@ -35,13 +35,16 @@ Options:
 	}
 	flag.Parse()
 
+	// Warn about deprecated flags
+	if *session != "" {
+		fmt.Fprintf(os.Stderr, "Warning: -session flag is deprecated and ignored (tracking is now global)\n")
+	}
+	if *collection != "" {
+		fmt.Fprintf(os.Stderr, "Warning: -collection flag is deprecated and ignored\n")
+	}
+
 	args := flag.Args()
 	if len(args) < 2 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	if *session == "" {
-		fmt.Fprintf(os.Stderr, "Error: -session is required\n\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -108,11 +111,7 @@ Options:
 		if len(folders) == 0 {
 			fmt.Println("No date folders found to upload.")
 		} else {
-			uploadArgs := []string{"-session", *session}
-			if *collection != "" {
-				uploadArgs = append(uploadArgs, "-collection", *collection)
-			}
-			uploadArgs = append(uploadArgs, folders...)
+			uploadArgs := folders
 
 			if err := runTool(selfDir, "google-uploader", uploadArgs...); err != nil {
 				log.Fatalf("google-uploader failed: %v", err)

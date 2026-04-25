@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -26,7 +24,6 @@ import (
 )
 
 const (
-	stateFilePrefix = "upload_state_"
 	configDir       = ".google_uploader"
 	maxRetries      = 3
 	retryDelay      = 5 * time.Second
@@ -35,91 +32,16 @@ const (
 	photosScope     = "https://www.googleapis.com/auth/photoslibrary.appendonly"
 )
 
-var (
-	session     = flag.String("session", "", "Session name (required) — state is saved to upload_state_<name>.json")
-	collection  = flag.String("collection", "", "Single album/playlist name for all media (instead of per-folder)")
-	consolidate = flag.Bool("consolidate", false, "Move already-uploaded items into the collection (requires -collection)")
-)
-
-type FolderState struct {
-	FolderName      string            `json:"folder_name"`
-	FolderPath      string            `json:"folder_path"`
-	PlaylistID      string            `json:"playlist_id"`
-	AlbumID         string            `json:"album_id"`
-	UploadedVideos  map[string]string `json:"uploaded_videos"`  // filename -> videoID
-	UploadedPhotos  map[string]string `json:"uploaded_photos"`  // filename -> mediaItemID
-	FailedFiles     map[string]string `json:"failed_files"`     // filename -> error message
-	LastProcessed   string            `json:"last_processed"`
-	TotalVideos     int               `json:"total_videos"`
-	CompletedVideos int               `json:"completed_videos"`
-	TotalPhotos     int               `json:"total_photos"`
-	CompletedPhotos int               `json:"completed_photos"`
-	PhotosDone      bool              `json:"photos_done"`
-	VideosDone      bool              `json:"videos_done"`
-	Completed       bool              `json:"completed"`
-}
-
-type MultiUploadState struct {
-	Folders              map[string]*FolderState `json:"folders"`                         // folder abs path -> state
-	CollectionName       string                  `json:"collection_name,omitempty"`       // single collection name
-	CollectionAlbumID    string                  `json:"collection_album_id,omitempty"`   // single shared album ID
-	CollectionPlaylistID string                  `json:"collection_playlist_id,omitempty"` // single shared playlist ID
-	ConsolidatedPhotos   map[string]bool         `json:"consolidated_photos,omitempty"`   // media item IDs already added to collection album
-	ConsolidatedVideos   map[string]bool         `json:"consolidated_videos,omitempty"`   // video IDs already added to collection playlist
-	InvalidPhotoIDs      map[string]bool         `json:"invalid_photo_ids,omitempty"`     // media item IDs that failed consolidation
-}
-
 func main() {
-	flag.Parse()
-	folders := flag.Args()
-
-	if *session == "" {
-		log.Fatal("Error: -session flag is required\nUsage: google_uploader -session <name> [-collection <name>] [-consolidate] /path/to/folder1 [/path/to/folder2 ...]")
-	}
-
-	stateFile := stateFilePrefix + *session + ".json"
-
-	// Always load existing state for this session
-	state := loadState(stateFile)
-
-	// Save state on Ctrl+C
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		fmt.Println("\n⚠ Interrupted — saving state...")
-		saveState(state, stateFile)
-		fmt.Printf("State saved to %s\n", stateFile)
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: google-uploader /path/to/folder1 [/path/to/folder2 ...]\n")
 		os.Exit(1)
-	}()
-
-	// Resolve collection name: CLI flag takes priority, then saved state
-	useCollection := *collection
-	if useCollection == "" && state.CollectionName != "" {
-		useCollection = state.CollectionName
-		fmt.Printf("Using saved collection: %s\n", useCollection)
-	}
-	if useCollection != "" {
-		state.CollectionName = useCollection
 	}
 
-	if *consolidate && useCollection == "" {
-		log.Fatal("Error: -consolidate requires -collection (or a session with a saved collection)\nUsage: google_uploader -session <name> -collection <name> -consolidate")
-	}
+	folders := os.Args[1:]
 
-	// Consolidate mode: move already-uploaded items into a single collection
-	if *consolidate {
-		ctx := context.Background()
-		config, err := getOAuthConfig()
-		if err != nil {
-			log.Fatalf("Error loading credentials: %v", err)
-		}
-		httpClient := getClient(ctx, config)
-		runConsolidate(state, httpClient, stateFile)
-		return
-	}
-
-	// Merge arg folders into state
+	// Resolve and validate folder paths
+	var folderPaths []string
 	for _, folder := range folders {
 		absPath, err := filepath.Abs(folder)
 		if err != nil {
@@ -128,24 +50,13 @@ func main() {
 		if _, err := os.Stat(absPath); os.IsNotExist(err) {
 			log.Fatalf("Error: Folder does not exist: %s", absPath)
 		}
-		if _, exists := state.Folders[absPath]; !exists {
-			state.Folders[absPath] = &FolderState{
-				FolderName:     filepath.Base(absPath),
-				FolderPath:     absPath,
-				UploadedVideos: make(map[string]string),
-				UploadedPhotos: make(map[string]string),
-				FailedFiles:    make(map[string]string),
-			}
-		}
+		folderPaths = append(folderPaths, absPath)
 	}
-
-	if len(state.Folders) == 0 {
-		log.Fatal("Error: no folders in session — provide at least one folder path\nUsage: google_uploader -session <name> [-collection <name>] /path/to/folder1 [/path/to/folder2 ...]")
-	}
+	sort.Strings(folderPaths)
 
 	// Determine the common parent for the top-level tracker
 	trackerRoot := ""
-	for path := range state.Folders {
+	for _, path := range folderPaths {
 		parent := filepath.Dir(path)
 		if trackerRoot == "" {
 			trackerRoot = parent
@@ -161,53 +72,47 @@ func main() {
 		topTracker = tracker.LoadTopLevel(trackerRoot)
 	}
 
-	// Migrate session state uploads into per-folder trackers
-	for absPath, fs := range state.Folders {
-		ft := tracker.LoadFolder(absPath)
-		migrated := false
-		if ft.MergePhotos(fs.UploadedPhotos) > 0 {
-			migrated = true
-		}
-		if ft.MergeVideos(fs.UploadedVideos) > 0 {
-			migrated = true
-		}
-		if migrated {
-			tracker.SaveFolder(absPath, ft)
-		}
-	}
-
-	// Collect folders still needing work
-	var folderPaths []string
-	for path, fs := range state.Folders {
-		// Clear failed files so they get retried
-		if len(fs.FailedFiles) > 0 {
-			fs.FailedFiles = make(map[string]string)
-			fs.Completed = false
-			fs.PhotosDone = false
-			fs.VideosDone = false
-		}
-
-		// Check top-level tracker for completion
+	// Filter out completed folders
+	var activePaths []string
+	for _, path := range folderPaths {
 		folderName := filepath.Base(path)
-		if topTracker != nil && topTracker.IsCompleted(folderName) && fs.Completed {
+		if topTracker != nil && topTracker.IsCompleted(folderName) {
 			continue
 		}
-
-		// If top-level says incomplete but session says complete, reopen it
-		if fs.Completed {
-			fs.Completed = false
-			fs.PhotosDone = false
-			fs.VideosDone = false
-		}
-
-		folderPaths = append(folderPaths, path)
+		activePaths = append(activePaths, path)
 	}
-	sort.Strings(folderPaths)
 
-	if len(folderPaths) == 0 {
+	if len(activePaths) == 0 {
 		fmt.Println("All folders have been fully uploaded.")
 		return
 	}
+
+	// Load per-folder trackers and clear failed files for retry
+	folderTrackers := make(map[string]*tracker.FolderTracker)
+	for _, folderPath := range activePaths {
+		ft := tracker.LoadFolder(folderPath)
+		// Clear failed files so they get retried
+		if len(ft.FailedFiles) > 0 {
+			ft.FailedFiles = make(map[string]string)
+		}
+		folderTrackers[folderPath] = ft
+	}
+
+	// Save trackers on Ctrl+C
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n⚠ Interrupted — saving tracker state...")
+		for folderPath, ft := range folderTrackers {
+			tracker.SaveFolder(folderPath, ft)
+		}
+		if topTracker != nil && trackerRoot != "" {
+			tracker.SaveTopLevel(trackerRoot, topTracker)
+		}
+		fmt.Println("Tracker state saved.")
+		os.Exit(1)
+	}()
 
 	ctx := context.Background()
 
@@ -218,20 +123,18 @@ func main() {
 	httpClient := getClient(ctx, config)
 
 	fmt.Printf("\n=== Google Uploader ===\n")
-	fmt.Printf("Processing %d folder(s)\n", len(folderPaths))
+	fmt.Printf("Processing %d folder(s)\n", len(activePaths))
 
 	totalPhotosUploaded := 0
 	totalVideosUploaded := 0
 
-	// Pre-scan all folders for total counts (using per-folder trackers)
+	// Pre-scan all folders for total counts
 	overallTotalPhotos := 0
 	overallTotalVideos := 0
 	overallCompletedPhotos := 0
 	overallCompletedVideos := 0
-	folderTrackers := make(map[string]*tracker.FolderTracker)
-	for _, folderPath := range folderPaths {
-		ft := tracker.LoadFolder(folderPath)
-		folderTrackers[folderPath] = ft
+	for _, folderPath := range activePaths {
+		ft := folderTrackers[folderPath]
 		photos, _ := getImageFiles(folderPath)
 		videos, _ := getVideoFiles(folderPath)
 		overallTotalPhotos += len(photos)
@@ -244,23 +147,9 @@ func main() {
 	fmt.Println("\n📷 Pass 1: Uploading photos to Google Photos...")
 	fmt.Printf("  Overall: %d/%d photos completed\n", overallCompletedPhotos, overallTotalPhotos)
 
-	// In collection mode, create or reuse the single album
-	if useCollection != "" && state.CollectionAlbumID == "" {
-		albumID, err := createPhotosAlbum(httpClient, state.CollectionName)
-		if err != nil {
-			log.Printf("ERROR: Failed to create collection album: %v\n", err)
-		} else {
-			state.CollectionAlbumID = albumID
-			fmt.Printf("  Created collection album: %s (ID: %s)\n", state.CollectionName, albumID)
-			saveState(state, stateFile)
-		}
-	} else if useCollection != "" {
-		fmt.Printf("  Using existing collection album ID: %s\n", state.CollectionAlbumID)
-	}
-
-	for folderIdx, folderPath := range folderPaths {
-		fs := state.Folders[folderPath]
+	for folderIdx, folderPath := range activePaths {
 		ft := folderTrackers[folderPath]
+		folderName := filepath.Base(folderPath)
 
 		photos, err := getImageFiles(folderPath)
 		if err != nil {
@@ -269,53 +158,25 @@ func main() {
 		}
 
 		if len(photos) == 0 {
-			fmt.Printf("\n[Folder %d/%d] %s — no photos found, skipping\n", folderIdx+1, len(folderPaths), fs.FolderName)
+			fmt.Printf("\n[Folder %d/%d] %s — no photos found, skipping\n", folderIdx+1, len(activePaths), folderName)
 			continue
 		}
 
-		fs.TotalPhotos = len(photos)
 		completedCount := 0
 		for _, p := range photos {
 			if ft.HasPhoto(filepath.Base(p)) {
 				completedCount++
 			}
 		}
-		fmt.Printf("\n[Folder %d/%d] %s — %d photo(s)\n", folderIdx+1, len(folderPaths), fs.FolderName, len(photos))
+		fmt.Printf("\n[Folder %d/%d] %s — %d photo(s)\n", folderIdx+1, len(activePaths), folderName, len(photos))
 
 		if completedCount > 0 {
-			fmt.Printf("  Resuming: %d/%d photos already uploaded\n", completedCount, fs.TotalPhotos)
+			fmt.Printf("  Resuming: %d/%d photos already uploaded\n", completedCount, len(photos))
 		}
 
-		// Check if all photos are already uploaded via per-folder tracker
-		allPhotosDone := completedCount == len(photos)
-		if allPhotosDone {
-			fs.PhotosDone = true
-			fmt.Printf("  ✓ Photos already complete for %s\n", fs.FolderName)
+		if completedCount == len(photos) {
+			fmt.Printf("  ✓ Photos already complete for %s\n", folderName)
 			continue
-		}
-
-		// Determine which album to use
-		albumID := ""
-		if useCollection != "" {
-			albumID = state.CollectionAlbumID
-			if albumID == "" {
-				log.Printf("ERROR: No collection album available — skipping photos for %s\n", fs.FolderName)
-				continue
-			}
-		} else {
-			if fs.AlbumID == "" {
-				id, err := createPhotosAlbum(httpClient, fs.FolderName)
-				if err != nil {
-					log.Printf("ERROR: Failed to create album for %s: %v — skipping photos for this folder\n", fs.FolderName, err)
-					continue
-				}
-				fs.AlbumID = id
-				fmt.Printf("  Created album: %s (ID: %s)\n", fs.FolderName, id)
-				saveState(state, stateFile)
-			} else {
-				fmt.Printf("  Using existing album ID: %s\n", fs.AlbumID)
-			}
-			albumID = fs.AlbumID
 		}
 
 		fmt.Println("  " + strings.Repeat("-", 46))
@@ -328,39 +189,33 @@ func main() {
 				continue
 			}
 
-			if _, failed := fs.FailedFiles[filename]; failed {
+			if _, failed := ft.FailedFiles[filename]; failed {
 				fmt.Printf("  [%d/%d] ✗ Skipping (previously failed): %s\n", i+1, len(photos), filename)
 				continue
 			}
 
 			fmt.Printf("  [%d/%d] Uploading: %s\n", i+1, len(photos), filename)
 
-			itemID, err := uploadPhotoWithRetry(httpClient, photoPath, albumID, maxRetries)
+			itemID, err := uploadPhotoWithRetry(httpClient, photoPath, maxRetries)
 			if err != nil {
 				log.Printf("  ✗ Failed to upload %s after %d attempts: %v — skipping\n", filename, maxRetries, err)
-				fs.FailedFiles[filename] = err.Error()
-				saveState(state, stateFile)
+				ft.FailedFiles[filename] = err.Error()
+				tracker.SaveFolder(folderPath, ft)
 				continue
 			}
 
 			fmt.Printf("    ✓ Photo uploaded successfully! ID: %s\n", itemID)
 
-			// Write to both per-folder tracker and session state
 			ft.UploadedPhotos[filename] = itemID
-			fs.UploadedPhotos[filename] = itemID
-			fs.LastProcessed = filename
-			fs.CompletedPhotos++
 			totalPhotosUploaded++
 			overallCompletedPhotos++
 			tracker.SaveFolder(folderPath, ft)
-			saveState(state, stateFile)
 
-			fmt.Printf("    Progress: %d/%d photos (folder) | %d/%d photos (overall)\n", fs.CompletedPhotos, fs.TotalPhotos, overallCompletedPhotos, overallTotalPhotos)
+			fmt.Printf("    Progress: %d/%d photos (folder) | %d/%d photos (overall)\n",
+				completedCount+totalPhotosUploaded, len(photos), overallCompletedPhotos, overallTotalPhotos)
 		}
 
-		fs.PhotosDone = true
-		saveState(state, stateFile)
-		fmt.Printf("  ✓ Photos complete for %s\n", fs.FolderName)
+		fmt.Printf("  ✓ Photos pass complete for %s\n", folderName)
 	}
 
 	// ── Global Pass 2: Videos across all folders ──
@@ -369,18 +224,16 @@ func main() {
 
 	// Determine if YouTube service is needed
 	needsYouTube := false
-	for _, folderPath := range folderPaths {
+	for _, folderPath := range activePaths {
 		ft := folderTrackers[folderPath]
 		videos, _ := getVideoFiles(folderPath)
-		allVideosDone := true
 		for _, v := range videos {
 			if !ft.HasVideo(filepath.Base(v)) {
-				allVideosDone = false
+				needsYouTube = true
 				break
 			}
 		}
-		if !allVideosDone && len(videos) > 0 {
-			needsYouTube = true
+		if needsYouTube {
 			break
 		}
 	}
@@ -391,25 +244,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error creating YouTube service: %v", err)
 		}
-
-		// In collection mode, create or reuse the single playlist
-		if useCollection != "" && state.CollectionPlaylistID == "" {
-			playlistID, err := createPlaylist(ytService, state.CollectionName)
-			if err != nil {
-				log.Printf("ERROR: Failed to create collection playlist: %v\n", err)
-			} else {
-				state.CollectionPlaylistID = playlistID
-				fmt.Printf("  Created collection playlist: %s (ID: %s)\n", state.CollectionName, playlistID)
-				saveState(state, stateFile)
-			}
-		} else if useCollection != "" {
-			fmt.Printf("  Using existing collection playlist ID: %s\n", state.CollectionPlaylistID)
-		}
 	}
 
-	for folderIdx, folderPath := range folderPaths {
-		fs := state.Folders[folderPath]
+	for folderIdx, folderPath := range activePaths {
 		ft := folderTrackers[folderPath]
+		folderName := filepath.Base(folderPath)
 
 		videos, err := getVideoFiles(folderPath)
 		if err != nil {
@@ -418,52 +257,25 @@ func main() {
 		}
 
 		if len(videos) == 0 {
-			fmt.Printf("\n[Folder %d/%d] %s — no videos found, skipping\n", folderIdx+1, len(folderPaths), fs.FolderName)
+			fmt.Printf("\n[Folder %d/%d] %s — no videos found, skipping\n", folderIdx+1, len(activePaths), folderName)
 			continue
 		}
 
-		fs.TotalVideos = len(videos)
 		completedCount := 0
 		for _, v := range videos {
 			if ft.HasVideo(filepath.Base(v)) {
 				completedCount++
 			}
 		}
-		fmt.Printf("\n[Folder %d/%d] %s — %d video(s)\n", folderIdx+1, len(folderPaths), fs.FolderName, len(videos))
+		fmt.Printf("\n[Folder %d/%d] %s — %d video(s)\n", folderIdx+1, len(activePaths), folderName, len(videos))
 
 		if completedCount > 0 {
-			fmt.Printf("  Resuming: %d/%d videos already uploaded\n", completedCount, fs.TotalVideos)
+			fmt.Printf("  Resuming: %d/%d videos already uploaded\n", completedCount, len(videos))
 		}
 
-		allVideosDone := completedCount == len(videos)
-		if allVideosDone {
-			fs.VideosDone = true
-			fmt.Printf("  ✓ Videos already complete for %s\n", fs.FolderName)
+		if completedCount == len(videos) {
+			fmt.Printf("  ✓ Videos already complete for %s\n", folderName)
 			continue
-		}
-
-		// Determine which playlist to use
-		playlistID := ""
-		if useCollection != "" {
-			playlistID = state.CollectionPlaylistID
-			if playlistID == "" {
-				log.Printf("ERROR: No collection playlist available — skipping videos for %s\n", fs.FolderName)
-				continue
-			}
-		} else {
-			if fs.PlaylistID == "" {
-				id, err := createPlaylist(ytService, fs.FolderName)
-				if err != nil {
-					log.Printf("ERROR: Failed to create playlist for %s: %v — skipping videos for this folder\n", fs.FolderName, err)
-					continue
-				}
-				fs.PlaylistID = id
-				fmt.Printf("  Created playlist: %s (ID: %s)\n", fs.FolderName, id)
-				saveState(state, stateFile)
-			} else {
-				fmt.Printf("  Using existing playlist ID: %s\n", fs.PlaylistID)
-			}
-			playlistID = fs.PlaylistID
 		}
 
 		fmt.Println("  " + strings.Repeat("-", 46))
@@ -476,7 +288,7 @@ func main() {
 				continue
 			}
 
-			if _, failed := fs.FailedFiles[filename]; failed {
+			if _, failed := ft.FailedFiles[filename]; failed {
 				fmt.Printf("  [%d/%d] ✗ Skipping (previously failed): %s\n", i+1, len(videos), filename)
 				continue
 			}
@@ -486,58 +298,37 @@ func main() {
 			videoID, err := uploadVideoWithRetry(ytService, videoPath, maxRetries)
 			if err != nil {
 				log.Printf("  ✗ Failed to upload %s after %d attempts: %v — skipping\n", filename, maxRetries, err)
-				fs.FailedFiles[filename] = err.Error()
-				saveState(state, stateFile)
+				ft.FailedFiles[filename] = err.Error()
+				tracker.SaveFolder(folderPath, ft)
 				continue
 			}
 
 			fmt.Printf("    ✓ Video uploaded successfully! ID: %s\n", videoID)
 
-			err = addToPlaylistWithRetry(ytService, playlistID, videoID, maxRetries)
-			if err != nil {
-				log.Printf("WARNING: Failed to add video %s to playlist: %v\n", videoID, err)
-			} else {
-				fmt.Printf("    ✓ Added to playlist\n")
-			}
-
-			// Write to both per-folder tracker and session state
 			ft.UploadedVideos[filename] = videoID
-			fs.UploadedVideos[filename] = videoID
-			fs.LastProcessed = filename
-			fs.CompletedVideos++
 			totalVideosUploaded++
 			overallCompletedVideos++
 			tracker.SaveFolder(folderPath, ft)
-			saveState(state, stateFile)
 
-			fmt.Printf("    Progress: %d/%d videos (folder) | %d/%d videos (overall)\n", fs.CompletedVideos, fs.TotalVideos, overallCompletedVideos, overallTotalVideos)
+			fmt.Printf("    Progress: %d/%d videos (folder) | %d/%d videos (overall)\n",
+				completedCount+totalVideosUploaded, len(videos), overallCompletedVideos, overallTotalVideos)
 		}
 
-		fs.VideosDone = true
-		saveState(state, stateFile)
-		fmt.Printf("  ✓ Videos complete for %s\n", fs.FolderName)
+		fmt.Printf("  ✓ Videos pass complete for %s\n", folderName)
 	}
 
-	// ── Mark folders as completed and update top-level tracker ──
-	for _, folderPath := range folderPaths {
-		fs := state.Folders[folderPath]
+	// ── Mark folders as completed in top-level tracker ──
+	for _, folderPath := range activePaths {
 		ft := folderTrackers[folderPath]
-
-		if !fs.PhotosDone || !fs.VideosDone {
-			continue
-		}
-
-		// Only mark complete if all current files are in the tracker and no failures
 		photos, _ := getImageFiles(folderPath)
 		videos, _ := getVideoFiles(folderPath)
-		if len(fs.FailedFiles) == 0 && ft.IsFullyUploaded(photos, videos) {
-			fs.Completed = true
+		if len(ft.FailedFiles) == 0 && ft.IsFullyUploaded(photos, videos) {
 			if topTracker != nil {
 				topTracker.MarkComplete(filepath.Base(folderPath))
 			}
 		}
+		tracker.SaveFolder(folderPath, ft)
 	}
-	saveState(state, stateFile)
 	if topTracker != nil && trackerRoot != "" {
 		tracker.SaveTopLevel(trackerRoot, topTracker)
 	}
@@ -546,8 +337,8 @@ func main() {
 
 	// Collect total failures
 	totalFailed := 0
-	for _, folderPath := range folderPaths {
-		totalFailed += len(state.Folders[folderPath].FailedFiles)
+	for _, folderPath := range activePaths {
+		totalFailed += len(folderTrackers[folderPath].FailedFiles)
 	}
 
 	if totalFailed > 0 {
@@ -561,36 +352,29 @@ func main() {
 	if totalVideosUploaded > 0 {
 		fmt.Printf("Total videos uploaded: %d\n", totalVideosUploaded)
 	}
-	if useCollection != "" {
-		if state.CollectionAlbumID != "" {
-			fmt.Printf("  Collection album: %s\n", state.CollectionAlbumID)
+
+	for _, folderPath := range activePaths {
+		ft := folderTrackers[folderPath]
+		folderName := filepath.Base(folderPath)
+		parts := []string{folderName + ":"}
+		if len(ft.UploadedPhotos) > 0 {
+			parts = append(parts, fmt.Sprintf("%d photos", len(ft.UploadedPhotos)))
 		}
-		if state.CollectionPlaylistID != "" {
-			fmt.Printf("  Collection playlist: https://www.youtube.com/playlist?list=%s\n", state.CollectionPlaylistID)
+		if len(ft.UploadedVideos) > 0 {
+			parts = append(parts, fmt.Sprintf("%d videos", len(ft.UploadedVideos)))
 		}
-	} else {
-		for _, folderPath := range folderPaths {
-			fs := state.Folders[folderPath]
-			parts := []string{fs.FolderName + ":"}
-			if fs.CompletedPhotos > 0 {
-				parts = append(parts, fmt.Sprintf("%d photos (album: %s)", fs.CompletedPhotos, fs.AlbumID))
-			}
-			if fs.CompletedVideos > 0 {
-				parts = append(parts, fmt.Sprintf("%d videos (playlist: https://www.youtube.com/playlist?list=%s)", fs.CompletedVideos, fs.PlaylistID))
-			}
-			if len(fs.FailedFiles) > 0 {
-				parts = append(parts, fmt.Sprintf("%d failed", len(fs.FailedFiles)))
-			}
-			fmt.Printf("  %s\n", strings.Join(parts, " | "))
+		if len(ft.FailedFiles) > 0 {
+			parts = append(parts, fmt.Sprintf("%d failed", len(ft.FailedFiles)))
 		}
+		fmt.Printf("  %s\n", strings.Join(parts, " | "))
 	}
 
 	if totalFailed > 0 {
-		fmt.Printf("\nState saved to %s — re-run with same -session to retry failed files\n", stateFile)
-	} else {
-		fmt.Printf("\nState saved to %s\n", stateFile)
+		fmt.Println("\nRe-run to retry failed files.")
 	}
 }
+
+// ── OAuth & Auth ──
 
 func configDirPath() string {
 	home, err := os.UserHomeDir()
@@ -689,272 +473,7 @@ func saveToken(path string, token *oauth2.Token) {
 	json.NewEncoder(f).Encode(token)
 }
 
-func loadState(stateFile string) *MultiUploadState {
-	state := &MultiUploadState{
-		Folders: make(map[string]*FolderState),
-	}
-
-	data, err := os.ReadFile(stateFile)
-	if err == nil {
-		if err := json.Unmarshal(data, state); err == nil {
-			for _, fs := range state.Folders {
-				if fs.UploadedVideos == nil {
-					fs.UploadedVideos = make(map[string]string)
-				}
-				if fs.UploadedPhotos == nil {
-					fs.UploadedPhotos = make(map[string]string)
-				}
-				if fs.FailedFiles == nil {
-					fs.FailedFiles = make(map[string]string)
-				}
-			}
-			fmt.Printf("Loaded existing session from %s\n", stateFile)
-			return state
-		}
-	}
-
-	return state
-}
-
-func saveState(state *MultiUploadState, stateFile string) {
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		log.Printf("Warning: Failed to marshal state: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(stateFile, data, 0644); err != nil {
-		log.Printf("Warning: Failed to save state: %v", err)
-	}
-}
-
-func runConsolidate(state *MultiUploadState, httpClient *http.Client, stateFile string) {
-	fmt.Printf("\n=== Consolidating into collection: %s ===\n", state.CollectionName)
-
-	// Initialize tracking maps if needed
-	if state.ConsolidatedPhotos == nil {
-		state.ConsolidatedPhotos = make(map[string]bool)
-	}
-	if state.ConsolidatedVideos == nil {
-		state.ConsolidatedVideos = make(map[string]bool)
-	}
-	if state.InvalidPhotoIDs == nil {
-		state.InvalidPhotoIDs = make(map[string]bool)
-	}
-
-	// Collect photo and video IDs not yet consolidated
-	var pendingPhotoIDs []string
-	var pendingVideoIDs []string
-	for _, fs := range state.Folders {
-		for _, itemID := range fs.UploadedPhotos {
-			if !state.ConsolidatedPhotos[itemID] && !state.InvalidPhotoIDs[itemID] {
-				pendingPhotoIDs = append(pendingPhotoIDs, itemID)
-			}
-		}
-		for _, videoID := range fs.UploadedVideos {
-			if !state.ConsolidatedVideos[videoID] {
-				pendingVideoIDs = append(pendingVideoIDs, videoID)
-			}
-		}
-	}
-
-	fmt.Printf("Photos: %d pending, %d already consolidated, %d invalid\n",
-		len(pendingPhotoIDs), len(state.ConsolidatedPhotos), len(state.InvalidPhotoIDs))
-	fmt.Printf("Videos: %d pending, %d already consolidated\n",
-		len(pendingVideoIDs), len(state.ConsolidatedVideos))
-
-	// Consolidate photos into single album
-	if len(pendingPhotoIDs) > 0 {
-		fmt.Println("\n📷 Consolidating photos...")
-
-		if state.CollectionAlbumID == "" {
-			albumID, err := createPhotosAlbum(httpClient, state.CollectionName)
-			if err != nil {
-				log.Printf("ERROR: Failed to create collection album: %v\n", err)
-			} else {
-				state.CollectionAlbumID = albumID
-				fmt.Printf("  Created album: %s (ID: %s)\n", state.CollectionName, albumID)
-				saveState(state, stateFile)
-			}
-		} else {
-			fmt.Printf("  Using existing album ID: %s\n", state.CollectionAlbumID)
-		}
-
-		if state.CollectionAlbumID != "" {
-			added := 0
-			failed := 0
-			pending := len(pendingPhotoIDs)
-			writeCount := 0
-
-			for i := 0; i < len(pendingPhotoIDs); i += 50 {
-				// Rate limit: 30 writes/min — wait between requests
-				if writeCount > 0 && writeCount%25 == 0 {
-					fmt.Println("  ⏳ Pausing 60s for rate limit...")
-					time.Sleep(60 * time.Second)
-				}
-
-				end := i + 50
-				if end > len(pendingPhotoIDs) {
-					end = len(pendingPhotoIDs)
-				}
-				batch := pendingPhotoIDs[i:end]
-
-				err := batchAddMediaItemsToAlbum(httpClient, state.CollectionAlbumID, batch)
-				writeCount++
-				if err != nil {
-					log.Printf("  ✗ Batch %d-%d failed: %v\n", i+1, end, err)
-
-					// Check if rate limited — if so, wait and retry the batch
-					if isRateLimited(err) {
-						fmt.Println("  ⏳ Rate limited — waiting 60s before retry...")
-						time.Sleep(60 * time.Second)
-						err = batchAddMediaItemsToAlbum(httpClient, state.CollectionAlbumID, batch)
-						writeCount++
-						if err == nil {
-							for _, id := range batch {
-								state.ConsolidatedPhotos[id] = true
-							}
-							added += len(batch)
-							pending -= len(batch)
-							saveState(state, stateFile)
-							fmt.Printf("  Progress: %d added, %d failed, %d pending\n", added, failed, pending)
-							continue
-						}
-					}
-
-					fmt.Println("    Retrying individually to find invalid IDs...")
-					for j, id := range batch {
-						if writeCount > 0 && writeCount%25 == 0 {
-							fmt.Println("  ⏳ Pausing 60s for rate limit...")
-							time.Sleep(60 * time.Second)
-						}
-						err := batchAddMediaItemsToAlbum(httpClient, state.CollectionAlbumID, []string{id})
-						writeCount++
-						if err != nil {
-							if isRateLimited(err) {
-								fmt.Println("  ⏳ Rate limited — waiting 60s...")
-								time.Sleep(60 * time.Second)
-								err = batchAddMediaItemsToAlbum(httpClient, state.CollectionAlbumID, []string{id})
-								writeCount++
-							}
-						}
-						if err != nil {
-							log.Printf("    ✗ [%d/%d] Invalid media item ID: %s\n", j+1, len(batch), id)
-							state.InvalidPhotoIDs[id] = true
-							failed++
-							pending--
-						} else {
-							fmt.Printf("    ✓ [%d/%d] Added\n", j+1, len(batch))
-							state.ConsolidatedPhotos[id] = true
-							added++
-							pending--
-						}
-					}
-					saveState(state, stateFile)
-				} else {
-					for _, id := range batch {
-						state.ConsolidatedPhotos[id] = true
-					}
-					added += len(batch)
-					pending -= len(batch)
-					saveState(state, stateFile)
-				}
-				fmt.Printf("  Progress: %d added, %d failed, %d pending\n", added, failed, pending)
-			}
-		}
-	}
-
-	// Consolidate videos into single playlist
-	if len(pendingVideoIDs) > 0 {
-		fmt.Println("\n🎬 Consolidating videos...")
-
-		ctx := context.Background()
-		ytService, err := getYouTubeService(ctx, httpClient)
-		if err != nil {
-			log.Printf("ERROR: Failed to create YouTube service: %v\n", err)
-			saveState(state, stateFile)
-			return
-		}
-
-		if state.CollectionPlaylistID == "" {
-			playlistID, err := createPlaylist(ytService, state.CollectionName)
-			if err != nil {
-				log.Printf("ERROR: Failed to create collection playlist: %v\n", err)
-			} else {
-				state.CollectionPlaylistID = playlistID
-				fmt.Printf("  Created playlist: %s (ID: %s)\n", state.CollectionName, playlistID)
-				saveState(state, stateFile)
-			}
-		} else {
-			fmt.Printf("  Using existing playlist ID: %s\n", state.CollectionPlaylistID)
-		}
-
-		if state.CollectionPlaylistID != "" {
-			added := 0
-			for i, videoID := range pendingVideoIDs {
-				err := addToPlaylistWithRetry(ytService, state.CollectionPlaylistID, videoID, maxRetries)
-				if err != nil {
-					log.Printf("  ✗ Failed to add video %s to playlist: %v\n", videoID, err)
-				} else {
-					state.ConsolidatedVideos[videoID] = true
-					added++
-				}
-				saveState(state, stateFile)
-				fmt.Printf("  Progress: %d/%d videos\n", i+1, len(pendingVideoIDs))
-			}
-		}
-	}
-
-	saveState(state, stateFile)
-	fmt.Printf("\n✓ Consolidation complete!\n")
-	fmt.Printf("  Photos: %d consolidated, %d invalid\n", len(state.ConsolidatedPhotos), len(state.InvalidPhotoIDs))
-	fmt.Printf("  Videos: %d consolidated\n", len(state.ConsolidatedVideos))
-	if state.CollectionAlbumID != "" {
-		fmt.Printf("  Album: %s\n", state.CollectionAlbumID)
-	}
-	if state.CollectionPlaylistID != "" {
-		fmt.Printf("  Playlist: https://www.youtube.com/playlist?list=%s\n", state.CollectionPlaylistID)
-	}
-	fmt.Printf("  State saved to %s\n", stateFile)
-}
-
-type apiError struct {
-	StatusCode int
-	Body       string
-}
-
-func (e *apiError) Error() string {
-	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Body)
-}
-
-func batchAddMediaItemsToAlbum(client *http.Client, albumID string, mediaItemIDs []string) error {
-	body := map[string]interface{}{
-		"mediaItemIds": mediaItemIDs,
-	}
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("error marshaling request: %v", err)
-	}
-
-	url := fmt.Sprintf("%s/albums/%s:batchAddMediaItems", photosAPIURL, albumID)
-	resp, err := client.Post(url, "application/json", bytes.NewReader(jsonBody))
-	if err != nil {
-		return fmt.Errorf("error adding media items: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return &apiError{StatusCode: resp.StatusCode, Body: string(respBody)}
-	}
-
-	return nil
-}
-
-func isRateLimited(err error) bool {
-	var ae *apiError
-	return errors.As(err, &ae) && ae.StatusCode == http.StatusTooManyRequests
-}
+// ── File scanning ──
 
 func getVideoFiles(folderPath string) ([]string, error) {
 	var videos []string
@@ -1016,40 +535,7 @@ func getImageFiles(folderPath string) ([]string, error) {
 	return images, nil
 }
 
-// Google Photos API functions (direct REST calls)
-
-func createPhotosAlbum(client *http.Client, title string) (string, error) {
-	body := map[string]interface{}{
-		"album": map[string]string{
-			"title": title,
-		},
-	}
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("error marshaling album request: %v", err)
-	}
-
-	resp, err := client.Post(photosAPIURL+"/albums", "application/json", bytes.NewReader(jsonBody))
-	if err != nil {
-		return "", fmt.Errorf("error creating album: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("error creating album (HTTP %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("error decoding album response: %v", err)
-	}
-
-	return result.ID, nil
-}
+// ── Google Photos upload ──
 
 func uploadPhotoBytes(client *http.Client, photoPath string) (string, error) {
 	file, err := os.Open(photoPath)
@@ -1094,9 +580,8 @@ func uploadPhotoBytes(client *http.Client, photoPath string) (string, error) {
 	return string(uploadToken), nil
 }
 
-func createMediaItem(client *http.Client, uploadToken, albumID, filename string) (string, error) {
+func createMediaItem(client *http.Client, uploadToken, filename string) (string, error) {
 	body := map[string]interface{}{
-		"albumId": albumID,
 		"newMediaItems": []map[string]interface{}{
 			{
 				"description": fmt.Sprintf("Uploaded via Google Uploader\nOriginal filename: %s", filename),
@@ -1152,7 +637,7 @@ func createMediaItem(client *http.Client, uploadToken, albumID, filename string)
 	return item.MediaItem.ID, nil
 }
 
-func uploadPhotoWithRetry(client *http.Client, photoPath, albumID string, maxRetries int) (string, error) {
+func uploadPhotoWithRetry(client *http.Client, photoPath string, maxRetries int) (string, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -1169,7 +654,7 @@ func uploadPhotoWithRetry(client *http.Client, photoPath, albumID string, maxRet
 		}
 
 		filename := filepath.Base(photoPath)
-		mediaItemID, err := createMediaItem(client, uploadToken, albumID, filename)
+		mediaItemID, err := createMediaItem(client, uploadToken, filename)
 		if err != nil {
 			lastErr = err
 			fmt.Printf("    Media item creation failed: %v\n", err)
@@ -1214,25 +699,7 @@ func getMimeType(filePath string) string {
 	return "application/octet-stream"
 }
 
-func createPlaylist(service *youtube.Service, title string) (string, error) {
-	playlist := &youtube.Playlist{
-		Snippet: &youtube.PlaylistSnippet{
-			Title:       title,
-			Description: fmt.Sprintf("Playlist created from folder: %s", title),
-		},
-		Status: &youtube.PlaylistStatus{
-			PrivacyStatus: "unlisted", // Change to "public" or "private" as needed
-		},
-	}
-
-	call := service.Playlists.Insert([]string{"snippet", "status"}, playlist)
-	response, err := call.Do()
-	if err != nil {
-		return "", err
-	}
-
-	return response.Id, nil
-}
+// ── YouTube upload ──
 
 func uploadVideoWithRetry(service *youtube.Service, videoPath string, maxRetries int) (string, error) {
 	var lastErr error
@@ -1262,7 +729,6 @@ func uploadVideo(service *youtube.Service, videoPath string) (string, error) {
 	}
 	defer file.Close()
 
-	// Get file info
 	fileInfo, err := file.Stat()
 	if err != nil {
 		return "", fmt.Errorf("error getting file info: %v", err)
@@ -1275,17 +741,16 @@ func uploadVideo(service *youtube.Service, videoPath string) (string, error) {
 		Snippet: &youtube.VideoSnippet{
 			Title:       title,
 			Description: fmt.Sprintf("Uploaded via Google Uploader\nOriginal filename: %s", filename),
-			CategoryId:  "22", // People & Blogs - change as needed
+			CategoryId:  "22",
 		},
 		Status: &youtube.VideoStatus{
-			PrivacyStatus:           "unlisted", // Change to "public" or "private" as needed
+			PrivacyStatus:           "unlisted",
 			SelfDeclaredMadeForKids: false,
 		},
 	}
 
 	call := service.Videos.Insert([]string{"snippet", "status"}, video)
 
-	// Show upload progress
 	fmt.Printf("  Uploading %s (%.2f MB)...\n", filename, float64(fileInfo.Size())/(1024*1024))
 
 	response, err := call.Media(file).Do()
@@ -1294,39 +759,4 @@ func uploadVideo(service *youtube.Service, videoPath string) (string, error) {
 	}
 
 	return response.Id, nil
-}
-
-func addToPlaylistWithRetry(service *youtube.Service, playlistID, videoID string, maxRetries int) error {
-	var lastErr error
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if attempt > 1 {
-			time.Sleep(retryDelay)
-		}
-
-		err := addToPlaylist(service, playlistID, videoID)
-		if err == nil {
-			return nil
-		}
-
-		lastErr = err
-	}
-
-	return lastErr
-}
-
-func addToPlaylist(service *youtube.Service, playlistID, videoID string) error {
-	playlistItem := &youtube.PlaylistItem{
-		Snippet: &youtube.PlaylistItemSnippet{
-			PlaylistId: playlistID,
-			ResourceId: &youtube.ResourceId{
-				Kind:    "youtube#video",
-				VideoId: videoID,
-			},
-		},
-	}
-
-	call := service.PlaylistItems.Insert([]string{"snippet"}, playlistItem)
-	_, err := call.Do()
-	return err
 }

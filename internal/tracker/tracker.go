@@ -25,6 +25,7 @@ type FolderCompletion struct {
 type FolderTracker struct {
 	UploadedPhotos map[string]string `json:"uploaded_photos"` // filename -> mediaItemID
 	UploadedVideos map[string]string `json:"uploaded_videos"` // filename -> videoID
+	FailedFiles    map[string]string `json:"failed_files"`    // filename -> error message
 }
 
 // LoadTopLevel loads the top-level tracker from the given directory.
@@ -79,6 +80,7 @@ func LoadFolder(folderPath string) *FolderTracker {
 	ft := &FolderTracker{
 		UploadedPhotos: make(map[string]string),
 		UploadedVideos: make(map[string]string),
+		FailedFiles:    make(map[string]string),
 	}
 	data, err := os.ReadFile(filepath.Join(folderPath, FolderFileName))
 	if err != nil {
@@ -90,6 +92,9 @@ func LoadFolder(folderPath string) *FolderTracker {
 	}
 	if ft.UploadedVideos == nil {
 		ft.UploadedVideos = make(map[string]string)
+	}
+	if ft.FailedFiles == nil {
+		ft.FailedFiles = make(map[string]string)
 	}
 	return ft
 }
