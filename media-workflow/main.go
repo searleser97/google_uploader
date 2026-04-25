@@ -82,6 +82,9 @@ Options:
 			log.Fatalf("copy-missing-files failed: %v", err)
 		}
 		fmt.Println()
+
+		// Auto-eject removable media origins
+		ejectRemovableOrigins(origins)
 	}
 
 	// Step 2: organize-by-date
@@ -186,4 +189,56 @@ func isDigits(s string) bool {
 		}
 	}
 	return true
+}
+
+// ejectRemovableOrigins detects which origins are on removable media and unmounts them.
+func ejectRemovableOrigins(origins []string) {
+	seen := make(map[string]bool)
+	for _, origin := range origins {
+		mountpoint, device, err := resolveMount(origin)
+		if err != nil {
+			continue
+		}
+		if seen[mountpoint] {
+			continue
+		}
+		seen[mountpoint] = true
+
+		removable, err := isRemovable(device)
+		if err != nil || !removable {
+			continue
+		}
+
+		fmt.Printf("\n🔌 Ejecting removable media: %s (%s)\n", mountpoint, device)
+		cmd := exec.Command("umount", mountpoint)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ Warning: failed to unmount %s: %v\n", mountpoint, err)
+		} else {
+			fmt.Printf("✔ %s safely unmounted — you can remove the device\n\n", mountpoint)
+		}
+	}
+}
+
+// resolveMount returns the mount point and source device for a given path.
+func resolveMount(path string) (mountpoint, device string, err error) {
+	out, err := exec.Command("findmnt", "-n", "-o", "TARGET,SOURCE", "--target", path).Output()
+	if err != nil {
+		return "", "", err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) < 2 {
+		return "", "", fmt.Errorf("unexpected findmnt output: %s", string(out))
+	}
+	return fields[0], fields[1], nil
+}
+
+// isRemovable checks whether a block device is removable (e.g., SD card, USB).
+func isRemovable(device string) (bool, error) {
+	out, err := exec.Command("lsblk", "-dn", "-o", "RM", device).Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) == "1", nil
 }
